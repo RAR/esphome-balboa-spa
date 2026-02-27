@@ -6,10 +6,20 @@ external_components:
       type: local
       path: components
 
+wifi:
+  ssid: "test_network"
+  password: "test_password"
+
+time:
+  - platform: sntp
+    id: spa_time_source
+    timezone: America/New_York
+
 balboa_spa:
   id: test_spa
   spa_temp_scale: F
   esphome_temp_scale: C
+  time_id: spa_time_source
 
 # Example 1: Using switches for simple ON/OFF control (backwards compatible)
 switch:

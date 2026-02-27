@@ -4,6 +4,10 @@
 #include "esphome/components/uart/uart.h"
 #include "esphome/core/log.h"
 
+#ifdef USE_TIME
+#include "esphome/components/time/real_time_clock.h"
+#endif
+
 #include "spa_types.h"
 #include "spa_config.h"
 #include "spa_state.h"
@@ -76,6 +80,10 @@ namespace esphome
       void set_esphome_temp_scale(TEMP_SCALE scale);
       void set_client_id(uint8_t id);
 
+#ifdef USE_TIME
+      void set_time_id(time::RealTimeClock *time_id);
+#endif
+
       bool is_communicating();
 
       void register_listener(const std::function<void(SpaState *)> &func) { this->listeners_.push_back(func); }
@@ -112,6 +120,11 @@ namespace esphome
       uint32_t last_received_time = 0;
       uint8_t send_preference_code = 0;
       uint8_t send_preference_data = 0;
+
+#ifdef USE_TIME
+      time::RealTimeClock *time_id_{nullptr};
+      int16_t last_auto_sync_day_{-1};  // Day of year when last auto-sync occurred (-1 = never)
+#endif
 
       TEMP_SCALE spa_temp_scale = TEMP_SCALE::UNDEFINED;
       TEMP_SCALE esphome_temp_scale = TEMP_SCALE::C;

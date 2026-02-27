@@ -1,9 +1,10 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import uart
-from esphome.const import CONF_ID
+from esphome.components import uart, time as time_component
+from esphome.const import CONF_ID, CONF_TIME_ID
 
 DEPENDENCIES = ['uart']
+AUTO_LOAD = []
 
 CONF_SPA_ID = "balboa_spa_id"
 CONF_SPA_TEMP_SCALE = "spa_temp_scale"
@@ -25,6 +26,7 @@ CONFIG_SCHEMA = cv.Schema({
     cv.Optional(CONF_SPA_TEMP_SCALE, default=254): cv.enum(TEMP_SCALES, upper=True),
     cv.Optional(CONF_ESPHOME_TEMP_SCALE, default="C"): cv.enum(TEMP_SCALES, upper=True),
     cv.Optional(CONF_CLIENT_ID): cv.int_range(min=1, max=47),
+    cv.Optional(CONF_TIME_ID): cv.use_id(time_component.RealTimeClock),
 }).extend(cv.COMPONENT_SCHEMA).extend(uart.UART_DEVICE_SCHEMA)
 
 def to_code(config):
@@ -39,5 +41,9 @@ def to_code(config):
 
     if client_id_conf := config.get(CONF_CLIENT_ID):
         cg.add(var.set_client_id(client_id_conf))
+
+    if CONF_TIME_ID in config:
+        time_ = yield cg.get_variable(config[CONF_TIME_ID])
+        cg.add(var.set_time_id(time_))
 
     yield uart.register_uart_device(var, config)

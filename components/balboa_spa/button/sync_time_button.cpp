@@ -18,7 +18,7 @@ namespace esphome
             ESP_LOGD(TAG, "Sync time button pressed");
 
             // Use the current system time (epoch time converted to local time)
-            time_t now_timestamp = time(nullptr);
+            time_t now_timestamp = ::time(nullptr);
             struct tm *time_info = localtime(&now_timestamp);
 
             if (time_info == nullptr || now_timestamp < 1000000000) // Basic validity check

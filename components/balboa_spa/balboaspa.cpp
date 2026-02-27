@@ -44,6 +44,25 @@ namespace esphome
                 }
             }
 
+#ifdef USE_TIME
+            // Automatic daily time sync
+            if (time_id_ != nullptr && is_communicating())
+            {
+                auto time_now = time_id_->now();
+                if (time_now.is_valid())
+                {
+                    int16_t current_day = time_now.day_of_year;
+                    if (current_day != last_auto_sync_day_)
+                    {
+                        set_hour(time_now.hour);
+                        set_minute(time_now.minute);
+                        last_auto_sync_day_ = current_day;
+                        ESP_LOGI(TAG, "Auto time sync: %02d:%02d (day %d)", time_now.hour, time_now.minute, current_day);
+                    }
+                }
+            }
+#endif
+
             while (available())
             {
                 read_serial();
@@ -960,6 +979,14 @@ namespace esphome
                 ESP_LOGW(TAG, "Invalid client ID override %d, must be between 1 and 47", id);
             }
         }
+
+#ifdef USE_TIME
+        void BalboaSpa::set_time_id(time::RealTimeClock *time_id)
+        {
+            time_id_ = time_id;
+            ESP_LOGD(TAG, "Time component configured for automatic daily sync");
+        }
+#endif
 
         float BalboaSpa::convert_c_to_f(float c)
         {

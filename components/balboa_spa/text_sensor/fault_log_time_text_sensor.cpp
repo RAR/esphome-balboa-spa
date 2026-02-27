@@ -23,7 +23,7 @@ namespace esphome
                 spaFaultLog->minutes != last_minutes_)
             {
                 // Calculate ISO 8601 timestamp from current time minus days_ago
-                time_t now_timestamp = time(nullptr);
+                time_t now_timestamp = ::time(nullptr);
                 
                 // Basic validity check for system time
                 if (now_timestamp < 1000000000)
