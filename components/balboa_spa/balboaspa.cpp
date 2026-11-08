@@ -10,12 +10,12 @@ namespace esphome
 
         // Protocol byte indices for status update (0x13) message
         static const uint8_t STATUS_UPDATE_REMINDER_BYTE = 6;
+        static const uint8_t CLEANUP_CYCLE_ACTIVE_VALUE = 0x0C;
 
         void BalboaSpa::setup()
         {
             input_queue.clear();
             output_queue.clear();
-            filtersettings_update_timer = 0;
         }
 
         void BalboaSpa::update()
@@ -23,25 +23,67 @@ namespace esphome
             uint32_t now = millis();
             if (last_received_time + 10000 < now)
             {
-                ESP_LOGW(TAG, "No new message since %d Seconds! Mark as dead!", (now - last_received_time) / 1000);
+                ESP_LOGW(TAG, "No new message since %u Seconds! Mark as dead!", (unsigned int)((now - last_received_time) / 1000));
                 status_set_error(LOG_STR("No Communication with Balboa Mainboard!"));
                 client_id = 0;
+                // Take the first reading after reconnecting as-is
+                current_temp_baseline_c = NAN;
+                pending_current_temp_c = NAN;
             }
             else if (status_has_error())
             {
                 status_clear_error();
             }
 
-            // Filter settings periodic update timer (every 5 minutes)
-            if (filtersettings_request_status == 2)
+            // Config request timeout guard.
+            //
+            // The spa does not always answer the first request, and without a
+            // retry the status sits at 1 forever, so the hardware configuration
+            // is never reported.
+            if (config_request_status == 1 &&
+                now - config_request_time >= ESPHOME_BALBOASPA_RESPONSE_TIMEOUT_MS)
             {
-                filtersettings_update_timer++;
-                if (filtersettings_update_timer >= 6000)
-                {                                      // 6000 * 50ms = 5 minutes
-                    filtersettings_request_status = 0; // Reset to request again
-                    filtersettings_update_timer = 0;
-                    ESP_LOGD(TAG, "Spa/debug/filtersettings_request_status: %s", "resetting for periodic update");
+                if (config_retries < 3)
+                {
+                    config_retries++;
+                    config_request_status = 0; // ask again
+                    ESP_LOGW(TAG, "Spa/config/status: no response, retry %d/3", config_retries);
                 }
+                else
+                {
+                    config_request_status = 3; // give up, unblock the chain
+                    ESP_LOGW(TAG, "Spa/config/status: %s", "no response after 3 retries, giving up");
+                }
+            }
+
+            // Fault log timeout guard.
+            //
+            // The request chain only asks for the filter settings once the fault
+            // log has come back. If the spa never answers, the status stays at 1
+            // forever and the filter schedule is never refreshed again. Retry a
+            // few times, then mark it abandoned so the chain can move on.
+            if (faultlog_request_status == 1 &&
+                now - faultlog_request_time >= ESPHOME_BALBOASPA_RESPONSE_TIMEOUT_MS)
+            {
+                if (faultlog_retries < 3)
+                {
+                    faultlog_retries++;
+                    faultlog_request_status = 0; // ask again
+                    ESP_LOGW(TAG, "Spa/debug/faultlog_request_status: no response, retry %d/3", faultlog_retries);
+                }
+                else
+                {
+                    faultlog_request_status = 3; // give up, unblock the chain
+                    ESP_LOGW(TAG, "Spa/debug/faultlog_request_status: %s", "no response after 3 retries, giving up");
+                }
+            }
+
+            // Filter settings periodic update timer (every 5 minutes)
+            if (filtersettings_request_status == 2 &&
+                now - filtersettings_received_time >= ESPHOME_BALBOASPA_FILTERSETTINGS_REFRESH_MS)
+            {
+                filtersettings_request_status = 0; // Reset to request again
+                ESP_LOGD(TAG, "Spa/debug/filtersettings_request_status: %s", "resetting for periodic update");
             }
 
 #ifdef USE_TIME
@@ -309,41 +351,62 @@ namespace esphome
                 return;
             }
 
-            // Drop until SOF is seen
-            if (input_queue.first() != 0x7E && received_byte != 0x7E)
+            // Drop until SOF is seen.
+            //
+            // An empty buffer is the normal state between frames, so check for it
+            // explicitly rather than reading first() off an empty deque.
+            if (input_queue.size() == 0)
+            {
+                if (received_byte != 0x7E)
+                {
+                    return;
+                }
+            }
+            else if (input_queue.first() != 0x7E && received_byte != 0x7E)
             {
                 input_queue.clear();
                 return;
             }
 
-            // Double SOF-marker, drop last one
-            if (input_queue.size() >= 2 && input_queue[1] == 0x7E)
+            // Double SOF-marker, drop the second SOF byte
+            //
+            // Checking input_queue[1] after the fact dropped the length byte that
+            // followed a duplicate SOF instead of the duplicate itself.
+            if (input_queue.size() == 1 && input_queue.first() == 0x7E && received_byte == 0x7E)
             {
-                input_queue.pop();
                 return;
             }
 
             input_queue.push(received_byte);
 
+            // Reject impossible lengths as soon as the length byte arrives.
+            //
+            // Otherwise a corrupted length swallows real packets until the CRC
+            // check fails, or overflows the buffer if it is 99 or more. 5 is the
+            // shortest frame (a clear-to-send poll). The upper bound is kept loose
+            // because packet lengths vary by model.
+            if (input_queue.size() == 2 && (received_byte < 5 || received_byte > 64))
+            {
+                ESP_LOGD(TAG, "Invalid packet length %u, dropping", received_byte);
+                input_queue.clear();
+                return;
+            }
+
             // Complete package
             // if (received_byte == 0x7E && input_queue[0] == 0x7E && input_queue[1] != 0x7E) {
             if (received_byte == 0x7E && input_queue.size() > 2 && input_queue.size() >= input_queue[1] + 2)
             {
-
-                if (input_queue.size() - 2 < input_queue[1])
-                {
-                    ESP_LOGD(TAG, "packet_size: %d, recv_size: %d", input_queue[1], input_queue.size());
-                    ESP_LOGD(TAG, "%s", "Packet incomplete!");
-                    input_queue.clear();
-                    return;
-                }
-
                 auto calculated_crc = this->crc8(input_queue, true);
                 auto packet_crc = input_queue[input_queue[1]];
                 if (calculated_crc != packet_crc)
                 {
                     ESP_LOGD(CRC_TAG, "CRC %d != Packet crc %d end=0x%X", calculated_crc, packet_crc, input_queue[input_queue[1] + 1]);
+                    // If this frame was cut short, the 0x7E that closed it is
+                    // really the next frame's SOF, so keep it. If it was a genuine
+                    // end marker, the next frame's SOF follows and the double-SOF
+                    // check drops it.
                     input_queue.clear();
+                    input_queue.push(0x7E);
                     return;
                 }
 
@@ -387,7 +450,8 @@ namespace esphome
                         output_queue.push(client_id);
                         output_queue.push(0xBF);
                         output_queue.push(0x21);
-                        output_queue.push(target_hour);
+                        // Bit 7 of the hour byte selects 24h display; preserve the panel's current mode
+                        output_queue.push(spaConfig.clock_mode ? (target_hour | 0x80) : target_hour);
                         output_queue.push(target_minute);
                     }
                     else if (send_command == 0xff)
@@ -410,6 +474,7 @@ namespace esphome
                             output_queue.push(0x01);
                             ESP_LOGD(TAG, "Spa/config/status: %s", "Getting config");
                             config_request_status = 1;
+                            config_request_time = millis();
                         }
                         else if (faultlog_request_status == 0)
                         { // Get the fault log
@@ -420,11 +485,15 @@ namespace esphome
                             output_queue.push(0xFF);
                             output_queue.push(0x00);
                             faultlog_request_status = 1;
+                            faultlog_request_time = millis();
                             ESP_LOGD(TAG, "Spa/debug/faultlog_request_status: %s", "requesting fault log, #1");
                         }
                         else if (filtersettings_request_status == 0 &&
-                                 (faultlog_request_status == 2 || faultlog_request_status == 0))
-                        { // Get the filter cycles log once we have the faultlog, or periodically
+                                 faultlog_request_status != 1)
+                        { // Get the filter cycles log once the fault log request has
+                          // finished, whether it succeeded (2), was already processed
+                          // (3) or was abandoned. Waiting only for status 2 meant an
+                          // unanswered fault log blocked this branch permanently.
                             output_queue.push(client_id);
                             output_queue.push(0xBF);
                             output_queue.push(0x22);
@@ -639,12 +708,60 @@ namespace esphome
             ESP_LOGD(TAG, "Spa/config/aux2: %d", spaConfig.aux2);
             ESP_LOGD(TAG, "Spa/config/temperature_scale: %d", spaConfig.temperature_scale);
             ESP_LOGD(TAG, "Spa/config/clock_mode: %d", spaConfig.clock_mode);
+            spaConfig.valid = 1;
             config_request_status = 2;
+            config_retries = 0;
 
             if (spa_temp_scale == TEMP_SCALE::UNDEFINED)
             {
                 spa_temp_scale = static_cast<TEMP_SCALE>(spaConfig.temperature_scale);
             }
+        }
+
+        bool BalboaSpa::accept_current_temp(float temp_c)
+        {
+            // Spike filter for the current temperature, in Celsius so it does
+            // not depend on the ESPHome display scale.
+            //
+            // Some spas report single out-of-line readings (heater or pump
+            // start-up noise). A jump of more than 5 C from the last accepted
+            // reading is only accepted once it has held within 0.5 C for 60
+            // seconds, e.g. after refilling with cold water. Status packets are
+            // only decoded when they change, so in practice that can take until
+            // the next clock minute after the 60 seconds are up.
+            static const float JUMP_THRESHOLD_C = 5.0f;
+            static const float SETTLE_TOLERANCE_C = 0.5f;
+            static const uint32_t SETTLE_TIME_MS = 60000;
+
+            if (std::isnan(current_temp_baseline_c) ||
+                std::fabs(temp_c - current_temp_baseline_c) <= JUMP_THRESHOLD_C)
+            {
+                current_temp_baseline_c = temp_c;
+                pending_current_temp_c = NAN;
+                return true;
+            }
+
+            uint32_t now = millis();
+            if (std::isnan(pending_current_temp_c) ||
+                std::fabs(temp_c - pending_current_temp_c) > SETTLE_TOLERANCE_C)
+            {
+                ESP_LOGD(TAG, "Spa/temperature/current: jump to %.2f C from %.2f C, waiting for it to settle",
+                         temp_c, current_temp_baseline_c);
+                pending_current_temp_c = temp_c;
+                pending_current_temp_start = now;
+                return false;
+            }
+
+            if (now - pending_current_temp_start < SETTLE_TIME_MS)
+            {
+                return false;
+            }
+
+            ESP_LOGD(TAG, "Spa/temperature/current: %.2f C held for %u s, accepting as new baseline",
+                     temp_c, (unsigned int)(SETTLE_TIME_MS / 1000));
+            current_temp_baseline_c = temp_c;
+            pending_current_temp_c = NAN;
+            return true;
         }
 
         void BalboaSpa::decodeState()
@@ -677,7 +794,7 @@ namespace esphome
             }
             else
             {
-                ESP_LOGW(TAG, "Spa/temperature/target INVALID %.2f %.2f %d %d",
+                ESP_LOGW(TAG, "Spa/temperature/target INVALID %u %.2f %d %d",
                          input_queue[25], temp_read, spaConfig.temperature_scale, esphome_temp_scale);
             }
 
@@ -693,11 +810,16 @@ namespace esphome
                     temp_read = convert_f_to_c(input_queue[7]);
                 }
 
-                if (temp_read > 80)
+                if (temp_read < 1.0f || temp_read > 80.0f)
                 {
-                    // Temp is getting close to boiling. Definitely invalid.
-                    ESP_LOGW(TAG, "Spa/temperature/current INVALID %.2f %.2f %d",
+                    // Below freezing, near boiling, or the spa scale is still
+                    // unknown (temp_read stays 0). Definitely invalid.
+                    ESP_LOGW(TAG, "Spa/temperature/current INVALID %u %.2f %d",
                              input_queue[7], temp_read, spaConfig.temperature_scale);
+                }
+                else if (!accept_current_temp(temp_read))
+                {
+                    // Sudden jump, held back until it settles
                 }
                 else if (esphome_temp_scale == TEMP_SCALE::C)
                 {
@@ -711,7 +833,7 @@ namespace esphome
                 }
                 else
                 {
-                    ESP_LOGW(TAG, "Spa/temperature/current INVALID %.2f %.2f %d %d",
+                    ESP_LOGW(TAG, "Spa/temperature/current INVALID %u %.2f %d %d",
                              input_queue[7], temp_read, spaConfig.temperature_scale, esphome_temp_scale);
                 }
             }
@@ -801,6 +923,14 @@ namespace esphome
                 spaState.light2 = spa_component_state;
             }
 
+            // 24:Flags Byte 19 - Cleanup Cycle (bits 0-3: 0x0C=ON, 0x04=OFF, 0x00=N/A)
+            spa_component_state = ((input_queue[24] & 0x0F) == CLEANUP_CYCLE_ACTIVE_VALUE) ? 1 : 0;
+            if (spa_component_state != spaState.cleanup_cycle)
+            {
+                ESP_LOGD(TAG, "Spa/cleanup_cycle/state: %.0f", spa_component_state);
+                spaState.cleanup_cycle = spa_component_state;
+            }
+
             // Parse reminder type from byte 6 of the status update (0x13 message)
             // 0x00=None, 0x04=Clean filter, 0x0A=Check pH, 0x09=Check sanitizer, 0x1E=Fault
             uint8_t reminder_value = input_queue[STATUS_UPDATE_REMINDER_BYTE];
@@ -842,7 +972,7 @@ namespace esphome
             ESP_LOGD(TAG, "Spa/filter2/state: %s", filter_payload);
 
             filtersettings_request_status = 2;
-            filtersettings_update_timer = 0; // Reset timer after successful decode
+            filtersettings_received_time = millis(); // Restart the periodic refresh window
 
             // Notify listeners about filter settings update
             for (const auto &listener : this->listeners_)
@@ -939,6 +1069,7 @@ namespace esphome
             ESP_LOGD(TAG, "Spa/fault/Hours: %d", spaFaultLog.hour);
             ESP_LOGD(TAG, "Spa/fault/Minutes: %d", spaFaultLog.minutes);
             faultlog_request_status = 2;
+            faultlog_retries = 0;
             // ESP_LOGD(TAG, "Spa/debug/faultlog_request_status: have the faultlog, #2");
 
             // Notify fault log listeners
